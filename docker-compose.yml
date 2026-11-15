@@ -1,0 +1,28 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: events
+      POSTGRES_PASSWORD: events
+      POSTGRES_DB: events
+    ports:
+      - "5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U events -d events"]
+      interval: 5s
+      retries: 20
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg://events:events@db:5432/events
+      EVENTS_API_URL: ${EVENTS_API_URL:-https://events-provider.dev-2.python-labs.ru}
+      LMS_TOKEN: ${LMS_TOKEN:?Set LMS_TOKEN in .env}
+    depends_on:
+      db:
+        condition: service_healthy
+volumes:
+  db-data:

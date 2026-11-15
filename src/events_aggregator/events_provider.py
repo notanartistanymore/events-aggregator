@@ -1,72 +1,95 @@
+from collections.abc import Iterator
+from datetime import date
 from urllib.parse import parse_qs, urlparse
+from uuid import UUID
 
 import httpx
 
 
 class EventsProviderClient:
-    def __init__(self, api_url: str, api_token: str):
-        self.api_url = api_url
-        self.api_token = api_token
+    def __init__(self, api_url: str, api_token: str, timeout: float = 20.0):
+        self.api_url = api_url.rstrip("/")
+        self.headers = {"x-api-key": api_token}
+        self.timeout = timeout
 
-    def get_events(self, changed_at: str, cursor: str | None = None):
+    def _request(self, method: str, path: str, *, params=None, json=None) -> dict:
+        with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
+            response = client.request(
+                method,
+                self.api_url + path,
+                headers=self.headers,
+                params=params,
+                json=json,
+            )
+            response.raise_for_status()
+            return response.json()
+
+    def get_events(self, changed_at: str, cursor: str | None = None) -> dict:
         params = {"changed_at": changed_at}
         if cursor is not None:
             params["cursor"] = cursor
-        response = httpx.get(
-            self.api_url + "/api/events/",
-            headers={"x-api-key": self.api_token},
-            params=params,
+        return self._request("GET", "/api/events/", params=params)
+
+    def get_seats(self, event_id: UUID) -> dict:
+        return self._request("GET", f"/api/events/{event_id}/seats/")
+
+    def register(
+        self, event_id: UUID, first_name: str, last_name: str, email: str, seat: str
+    ) -> dict:
+        return self._request(
+            "POST",
+            f"/api/events/{event_id}/register/",
+            json={"first_name": first_name, "last_name": last_name, "email": email, "seat": seat},
         )
-        response.raise_for_status()
-        return response.json()
+
+    def unregister(self, event_id: UUID, ticket_id: UUID) -> dict:
+        return self._request(
+            "DELETE", f"/api/events/{event_id}/unregister/", json={"ticket_id": str(ticket_id)}
+        )
 
 
-class EventsPaginator:
-    def __init__(self, client: EventsProviderClient, changed_at: str):
+class EventsPaginator(Iterator[dict]):
+    def __init__(self, client: EventsProviderClient, changed_at: str | date = "2000-01-01"):
         self.client = client
-        self.changed_at = changed_at
-
-        self.current_page = []
+        self.changed_at = str(changed_at)
+        self.current_page: list[dict] = []
         self.current_index = 0
-
-        self.next_cursor = None
-
+        self.next_cursor: str | None = None
         self.started = False
         self.finished = False
+        self.seen_cursors: set[str] = set()
 
-    @staticmethod
-    def _extract_cursor(next_page_url: str):
-        parsed_next_page_url = urlparse(url=next_page_url)
-        params = parse_qs(qs=parsed_next_page_url.query)
-        return params["cursor"][0]
-
-    def _load_page(self):
-        event_response = self.client.get_events(changed_at=self.changed_at, cursor=self.next_cursor)
-        self.current_page = event_response["results"]
-        if event_response["next"] is not None:
-            self.next_cursor = self._extract_cursor(event_response["next"])
-        else:
-            self.next_cursor = None
+    def _load_page(self) -> None:
+        response = self.client.get_events(self.changed_at, cursor=self.next_cursor)
+        self.current_page = response["results"]
         self.current_index = 0
+        url = response.get("next")
+        if url is None:
+            self.next_cursor = None
+        else:
+            values = parse_qs(urlparse(url).query).get("cursor")
+            if not values:
+                raise ValueError("Provider next URL missing cursor")
+            cursor = values[0]
+            if cursor in self.seen_cursors:
+                raise ValueError("Provider repeated cursor")
+            self.seen_cursors.add(cursor)
+            self.next_cursor = cursor
+        self.started = True
 
-    def __iter__(self):
+    def __iter__(self) -> "EventsPaginator":
         return self
 
-    def __next__(self):
-        while True:
-            if self.finished:
-                raise StopIteration
-
+    def __next__(self) -> dict:
+        while not self.finished:
             if not self.started:
                 self._load_page()
-                self.started = True
-
             if self.current_index < len(self.current_page):
-                current_event = self.current_page[self.current_index]
+                event = self.current_page[self.current_index]
                 self.current_index += 1
-                return current_event
-
-            if self.next_cursor is not None:
-                self._load_page()
-            else:
+                return event
+            if self.next_cursor is None:
                 self.finished = True
+                break
+            self._load_page()
+        raise StopIteration
