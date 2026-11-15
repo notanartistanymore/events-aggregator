@@ -7,6 +7,9 @@ from uuid import UUID
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
 
 from events_aggregator.cache import SeatsCache
@@ -61,6 +64,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Events Aggregator", lifespan=lifespan)
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request: Request,
+    exc: RequestValidationError,
+):
+    return JSONResponse(
+        status_code=400,
+        content={"detail": jsonable_encoder(exc.errors())},
+    )
 
 
 @app.get("/api/health", tags=["Dev"])
