@@ -127,7 +127,10 @@ async def health_check():
 @app.post("/api/sync/trigger", tags=["Sync"])
 async def sync_trigger(request: Request):
     if not await request.app.state.synchronizer.run():
-        raise HTTPException(409, "Synchronization already in progress")
+        return JSONResponse(
+            status_code=202,
+            content={"status": "already_running"},
+        )
     return {"status": "success"}
 
 
