@@ -107,7 +107,7 @@ app = FastAPI(title="Events Aggregator", lifespan=lifespan)
 
 
 @app.exception_handler(DomainError)
-async def domain_exception_handler(request: Request, exc: DomainError):
+async def domain_exception_handler(_request: Request, exc: DomainError):
     return JSONResponse(
         status_code=ERROR_STATUSES.get(type(exc), 500),
         content={"detail": str(exc)},
@@ -115,7 +115,7 @@ async def domain_exception_handler(request: Request, exc: DomainError):
 
 
 @app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
+async def validation_exception_handler(_request: Request, exc: RequestValidationError):
     return JSONResponse(status_code=400, content={"detail": jsonable_encoder(exc.errors())})
 
 

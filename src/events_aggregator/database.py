@@ -1,3 +1,4 @@
+from collections.abc import AsyncIterator
 from functools import lru_cache
 
 from sqlalchemy import create_engine
@@ -27,6 +28,6 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(get_async_engine(), expire_on_commit=False)
 
 
-async def get_db():
+async def get_db() -> AsyncIterator[AsyncSession]:
     async with get_session_factory()() as session:
         yield session
