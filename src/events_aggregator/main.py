@@ -7,14 +7,28 @@ from uuid import UUID
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from fastapi.encoders import jsonable_encoder
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from events_aggregator.cache import SeatsCache
 from events_aggregator.config import get_settings
-from events_aggregator.database import get_db, get_session_factory
+from events_aggregator.database import get_async_engine, get_db, get_session_factory
+from events_aggregator.errors import (
+    DomainError,
+    EventAlreadyStarted,
+    EventNotFound,
+    EventNotPublished,
+    ProviderAuthenticationFailed,
+    ProviderRateLimited,
+    ProviderRejected,
+    ProviderResourceNotFound,
+    ProviderUnavailable,
+    RegistrationClosed,
+    SeatUnavailable,
+    TicketNotFound,
+)
 from events_aggregator.events_provider import EventsProviderClient
 from events_aggregator.repositories import EventRepository, TicketRepository
 from events_aggregator.schemas import (
@@ -26,22 +40,32 @@ from events_aggregator.schemas import (
     TicketCreate,
     TicketCreated,
 )
-from events_aggregator.services import Synchronizer, TicketService, provider_error
+from events_aggregator.services import SeatsService, Synchronizer, TicketService
 
 logging.basicConfig(level=logging.INFO)
 settings = get_settings()
-provider = EventsProviderClient(
-    settings.events_api_url, settings.lms_token, settings.provider_timeout
-)
 cache = SeatsCache(ttl=30)
-synchronizer = Synchronizer(provider, get_session_factory())
+
+ERROR_STATUSES = {
+    EventNotFound: 404,
+    TicketNotFound: 404,
+    ProviderResourceNotFound: 404,
+    EventNotPublished: 400,
+    RegistrationClosed: 400,
+    SeatUnavailable: 400,
+    EventAlreadyStarted: 400,
+    ProviderRejected: 400,
+    ProviderAuthenticationFailed: 502,
+    ProviderRateLimited: 503,
+    ProviderUnavailable: 502,
+}
 
 
-async def scheduled_sync(stop: asyncio.Event):
-    # A single worker is assumed. Multi-replica deployments need a distributed lock.
+async def scheduled_sync(stop: asyncio.Event, synchronizer: Synchronizer):
+    # One worker; multiple processes require a distributed synchronization lock.
     while not stop.is_set():
         try:
-            await asyncio.to_thread(synchronizer.run)
+            await synchronizer.run()
         except Exception:
             logging.exception("Scheduled sync failed")
         try:
@@ -52,59 +76,75 @@ async def scheduled_sync(stop: asyncio.Event):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    stop = asyncio.Event()
-    task = asyncio.create_task(scheduled_sync(stop)) if settings.enable_background_sync else None
-    app.state.sync_task = task
-    try:
-        yield
-    finally:
-        stop.set()
-        if task is not None:
-            await task
+    async with httpx.AsyncClient(
+        timeout=settings.provider_timeout, follow_redirects=True
+    ) as http_client:
+        provider = EventsProviderClient(
+            settings.events_api_url,
+            settings.lms_token,
+            settings.provider_timeout,
+            client=http_client,
+        )
+        synchronizer = Synchronizer(provider, get_session_factory())
+        app.state.provider = provider
+        app.state.synchronizer = synchronizer
+        stop = asyncio.Event()
+        task = (
+            asyncio.create_task(scheduled_sync(stop, synchronizer))
+            if settings.enable_background_sync
+            else None
+        )
+        try:
+            yield
+        finally:
+            stop.set()
+            if task is not None:
+                await task
+    await get_async_engine().dispose()
 
 
 app = FastAPI(title="Events Aggregator", lifespan=lifespan)
 
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(
-    request: Request,
-    exc: RequestValidationError,
-):
+
+@app.exception_handler(DomainError)
+async def domain_exception_handler(request: Request, exc: DomainError):
     return JSONResponse(
-        status_code=400,
-        content={"detail": jsonable_encoder(exc.errors())},
+        status_code=ERROR_STATUSES.get(type(exc), 500),
+        content={"detail": str(exc)},
     )
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=400, content={"detail": jsonable_encoder(exc.errors())})
+
+
 @app.get("/api/health", tags=["Dev"])
-def health_check():
+async def health_check():
     return {"status": "ok"}
 
 
 @app.post("/api/sync/trigger", tags=["Sync"])
-def sync_trigger():
-    # Synchronous completion ensures clients see a completed sync at HTTP 200.
-    if not synchronizer.run():
+async def sync_trigger(request: Request):
+    if not await request.app.state.synchronizer.run():
         raise HTTPException(409, "Synchronization already in progress")
     return {"status": "success"}
 
 
 @app.get("/api/events", response_model=EventsPage, tags=["Events"])
 @app.get("/api/events/", response_model=EventsPage, include_in_schema=False)
-def get_events(
+async def get_events(
     request: Request,
     date_from: date | None = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=500),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
-    count, rows = EventRepository(db).list(date_from, page, page_size)
+    count, rows = await EventRepository(db).list(date_from, page, page_size)
     pages = ceil(count / page_size)
 
     def link(number: int) -> str:
-        params = dict(request.query_params)
-        params.update({"page": str(number), "page_size": str(page_size)})
-        return str(request.url.replace(query="")) + "?" + str(httpx.QueryParams(params))
+        return str(request.url.include_query_params(page=number, page_size=page_size))
 
     return EventsPage(
         count=count,
@@ -115,38 +155,31 @@ def get_events(
 
 
 @app.get("/api/events/{event_id}", response_model=EventDetail, tags=["Events"])
-def event_detail(event_id: UUID, db: Session = Depends(get_db)):
-    event = EventRepository(db).get(event_id)
+async def event_detail(event_id: UUID, db: AsyncSession = Depends(get_db)):
+    event = await EventRepository(db).get(event_id)
     if event is None:
         raise HTTPException(404, "Event not found")
     return EventDetail.model_validate(event)
 
 
 @app.get("/api/events/{event_id}/seats", response_model=SeatsResponse, tags=["Events"])
-def event_seats(event_id: UUID, db: Session = Depends(get_db)):
-    event = EventRepository(db).get(event_id)
-    if event is None:
-        raise HTTPException(404, "Event not found")
-    if event.status != "published":
-        raise HTTPException(400, "Event is not published")
-    seats = cache.get(event_id)
-    if seats is None:
-        try:
-            seats = provider.get_seats(event_id)["seats"]
-        except httpx.HTTPError as exc:
-            raise provider_error(exc) from exc
-        cache.set(event_id, seats)
+async def event_seats(event_id: UUID, request: Request, db: AsyncSession = Depends(get_db)):
+    seats = await SeatsService(request.app.state.provider, EventRepository(db), cache).get(event_id)
     return SeatsResponse(event_id=event_id, available_seats=seats)
 
 
 @app.post("/api/tickets", status_code=201, response_model=TicketCreated, tags=["Tickets"])
-def create_ticket(body: TicketCreate, db: Session = Depends(get_db)):
-    service = TicketService(provider, EventRepository(db), TicketRepository(db), cache)
-    return TicketCreated(ticket_id=service.create(body))
+async def create_ticket(body: TicketCreate, request: Request, db: AsyncSession = Depends(get_db)):
+    service = TicketService(
+        request.app.state.provider, EventRepository(db), TicketRepository(db), cache
+    )
+    return TicketCreated(ticket_id=await service.create(body))
 
 
 @app.delete("/api/tickets/{ticket_id}", response_model=SuccessResponse, tags=["Tickets"])
-def delete_ticket(ticket_id: UUID, db: Session = Depends(get_db)):
-    service = TicketService(provider, EventRepository(db), TicketRepository(db), cache)
-    service.cancel(ticket_id)
+async def delete_ticket(ticket_id: UUID, request: Request, db: AsyncSession = Depends(get_db)):
+    service = TicketService(
+        request.app.state.provider, EventRepository(db), TicketRepository(db), cache
+    )
+    await service.cancel(ticket_id)
     return SuccessResponse(success=True)

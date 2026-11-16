@@ -1,11 +1,11 @@
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+from alembic import context
+from events_aggregator import models  # noqa: F401
 from events_aggregator.config import get_settings
 from events_aggregator.database import Base
-from events_aggregator import models  # noqa: F401
 
 config = context.config
 if config.config_file_name:

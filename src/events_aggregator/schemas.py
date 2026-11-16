@@ -3,6 +3,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
+from events_aggregator.statuses import EventStatus
+
 
 class PlaceSummary(BaseModel):
     id: UUID
@@ -22,7 +24,7 @@ class EventSummary(BaseModel):
     place: PlaceSummary
     event_time: datetime
     registration_deadline: datetime
-    status: str
+    status: EventStatus
     number_of_visitors: int
     model_config = ConfigDict(from_attributes=True)
 
